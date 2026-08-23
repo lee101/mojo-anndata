@@ -81,12 +81,38 @@ def test_csr_repeated_rows_do_not_overrun_output_and_match_anndata():
     assert_same(got[selector], reference)
 
 
-def test_dense_simd_tail_and_parallel_threshold_match_anndata():
-    matrix = np.arange(2003 * 2001, dtype=np.float64).reshape(2003, 2001)
-    cols = np.arange(1999, dtype=np.int64)
-    got = AnnData(matrix)[np.arange(2003, dtype=np.int64), cols]
-    expected = upstream.AnnData(matrix)[np.arange(2003, dtype=np.int64), cols].copy()
+@pytest.mark.parametrize(("shape", "selected_cols"), [((33, 17), 15), ((1500, 1501), 1499)])
+def test_dense_simd_tail_and_parallel_threshold_match_anndata(shape, selected_cols):
+    matrix = np.arange(np.prod(shape), dtype=np.float64).reshape(shape)
+    rows = np.arange(shape[0], dtype=np.int64)
+    cols = np.arange(selected_cols, dtype=np.int64)
+    got = AnnData(matrix)[rows, cols]
+    expected = upstream.AnnData(matrix)[rows, cols].copy()
     np.testing.assert_allclose(got.X, expected.X)
+
+
+def test_csr_int64_indices_match_anndata():
+    matrix = sparse.csr_matrix(np.arange(30, dtype=np.float64).reshape(6, 5))
+    matrix.indices = matrix.indices.astype(np.int64)
+    matrix.indptr = matrix.indptr.astype(np.int64)
+    rows = np.array([5, 1, 1, 3], dtype=np.int64)
+    cols = np.array([4, 0, 2], dtype=np.int64)
+    got = AnnData(matrix)[rows, cols]
+    with pytest.warns(UserWarning, match="Observation names are not unique"):
+        expected = upstream.AnnData(matrix)[rows, cols].copy()
+    np.testing.assert_allclose(got.X.toarray(), expected.X.toarray())
+
+
+def test_noncanonical_csr_is_canonicalized_without_mutating_source():
+    matrix = sparse.csr_matrix((np.array([2., 3., 5., 7., 11.]),
+                                np.array([2, 0, 2, 1, 0], dtype=np.int32),
+                                np.array([0, 3, 5], dtype=np.int32)), shape=(2, 3))
+    adata = AnnData(matrix)
+    original_indices = adata.X.indices.copy()
+    got = adata[[1, 0], [2, 0]]
+    expected = upstream.AnnData(matrix)[[1, 0], [2, 0]].copy()
+    np.testing.assert_allclose(got.X.toarray(), expected.X.toarray())
+    np.testing.assert_array_equal(adata.X.indices, original_indices)
 
 
 def test_default_axis_names_and_named_indexing():

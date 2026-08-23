@@ -65,9 +65,9 @@ installed upstream `anndata` on the same arrays.
 
 | kernel | mojo-anndata | anndata | speedup |
 | --- | ---: | ---: | ---: |
-| dense f64 2000x400 -> 1500x300 | 1.29 ms | 6.36 ms | 4.95x |
-| dense f64 5500x1024 -> 4500x900 | 17.17 ms | 68.54 ms | 3.99x |
-| CSR f64 2000x300 -> 1500x180 | 1.60 ms | 2.47 ms | 1.54x |
+| dense f64 2000x400 -> 1500x300 | 1.22 ms | 6.71 ms | 5.51x |
+| dense f64 5500x1024 -> 4500x900 | 10.56 ms | 80.39 ms | 7.61x |
+| CSR f64 2000x300 -> 1500x180 | 0.84 ms | 2.59 ms | 3.10x |
 
 Numbers are workload- and machine-specific; rerun the benchmark before making
 performance decisions for a different matrix shape or sparsity pattern.
@@ -83,5 +83,9 @@ keeps all annotations aligned. The ctypes boundary passes contiguous buffer
 addresses as signed 64-bit integers, which the single Mojo compilation unit
 rebuilds as pointers. Dense matrices are row-major `float64`; the CSR kernel
 walks `indptr`, `indices`, and `data` once for each selected source row while a
-column map translates source columns into the destination layout. Python owns
-every allocation, so the native library has no allocation or lifetime policy.
+column map translates source columns into the destination layout. Dense slices
+with at least two million output elements are split across eight independent
+row chunks; smaller slices stay serial. Canonical CSR inputs are borrowed
+without a copy, and native int32 and int64 index kernels avoid dtype conversion
+at the FFI boundary. Python owns every allocation, so the native library has no
+allocation or lifetime policy.

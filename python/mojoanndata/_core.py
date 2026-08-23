@@ -12,6 +12,9 @@ from scipy import sparse
 
 from ._lib import addr, lib
 
+DENSE_PARALLEL_ELEMENTS = 2_000_000
+DENSE_PARALLEL_TASKS = 8
+
 
 def _frame(value: Any, n: int, axis: str) -> pd.DataFrame:
     if value is None:
@@ -82,32 +85,43 @@ def _take_dense(x: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray
         return source[np.ix_(rows, cols)].copy()
     target = np.empty((rows.size, cols.size), dtype=np.float64)
     if target.size:
-        lib().mad_dense_take_f64(addr(source), addr(rows), addr(cols), addr(target),
-                                  source.shape[1], rows.size, cols.size)
+        kernel = (lib().mad_dense_take_f64_parallel
+                  if (target.size >= DENSE_PARALLEL_ELEMENTS
+                      and rows.size >= DENSE_PARALLEL_TASKS)
+                  else lib().mad_dense_take_f64)
+        kernel(addr(source), addr(rows), addr(cols), addr(target), source.shape[1],
+               rows.size, cols.size)
     return target
 
 
 def _take_csr(x: sparse.csr_matrix, rows: np.ndarray, cols: np.ndarray):
     if x.dtype != np.float64 or np.unique(cols).size != cols.size:
         return x[rows, :][:, cols].copy()
-    source = x.copy()
-    source.sum_duplicates()
-    source.sort_indices()
-    col_map = np.full(source.shape[1], -1, dtype=np.int64)
-    col_map[cols] = np.arange(cols.size, dtype=np.int64)
-    indptr = np.ascontiguousarray(source.indptr, dtype=np.int64)
-    indices = np.ascontiguousarray(source.indices, dtype=np.int64)
+    if x.has_canonical_format and x.has_sorted_indices:
+        source = x
+    else:
+        source = x.copy()
+        source.sum_duplicates()
+        source.sort_indices()
+    index_dtype = source.indices.dtype
+    if index_dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+        index_dtype = np.dtype(np.int64)
+    indptr = np.ascontiguousarray(source.indptr, dtype=index_dtype)
+    indices = np.ascontiguousarray(source.indices, dtype=index_dtype)
+    col_map = np.full(source.shape[1], -1, dtype=index_dtype)
+    col_map[cols] = np.arange(cols.size, dtype=index_dtype)
     # Rows may be selected repeatedly, so source.nnz is not a safe capacity.
     # This is an upper bound; column filtering can only reduce it.
-    capacity = sum(int(indptr[row + 1] - indptr[row]) for row in rows)
-    out_indptr = np.empty(rows.size + 1, dtype=np.int64)
-    out_indices = np.empty(max(capacity, 1), dtype=np.int64)
+    capacity = int(np.sum(indptr[rows + 1] - indptr[rows], dtype=np.int64))
+    out_indptr = np.empty(rows.size + 1, dtype=index_dtype)
+    out_indices = np.empty(max(capacity, 1), dtype=index_dtype)
     out_data = np.empty(max(capacity, 1), dtype=np.float64)
     if rows.size and cols.size and source.nnz:
-        written = lib().mad_csr_take_f64(addr(indptr), addr(indices),
-                                         addr(source.data), addr(rows), addr(col_map),
-                                         addr(out_indptr), addr(out_indices), addr(out_data),
-                                         rows.size)
+        kernel = (lib().mad_csr_take_f64_i32 if index_dtype == np.dtype(np.int32)
+                  else lib().mad_csr_take_f64)
+        written = kernel(addr(indptr), addr(indices), addr(source.data), addr(rows),
+                         addr(col_map), addr(out_indptr), addr(out_indices), addr(out_data),
+                         rows.size)
     else:
         out_indptr.fill(0)
         written = 0
