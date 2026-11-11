@@ -92,9 +92,55 @@ shapes (5500x1024 -> 4500x900), alternating before/after in one session:
 Numbers are workload- and machine-specific; rerun the benchmark before making
 performance decisions for a different matrix shape or sparsity pattern.
 
-Dense and CSR slicing are memory-bound gathers/scatters with effectively zero
-arithmetic intensity, so there is no GPU path: transfer and launch overhead
-would lose to the CPU implementation.
+## GPU path: not taken
+
+**CPU only: memory-bound.** Every kernel in this port is a gather or scatter
+with no floating-point arithmetic: `src/capi.mojo` copies values and maps
+indices, and nothing multiplies or sums. `bench/analysis.md` (counting
+conventions, and §7) scores them at 0.042-0.129 flops/byte under a deliberately
+generous convention (one integer address computation per output element), i.e.
+**~16x below the ~2 flops/byte candidate bar at its highest** and ~48x at its
+lowest. Nothing in the ranked table
+qualifies, so no kernel was ported and no device code was written.
+
+The device itself is available, so this is not a "no GPU on the host" result:
+`nvidia-smi --query-gpu=memory.free` reported 5560-6352 MiB free out of
+32607 MiB (NVIDIA GeForce RTX 5090) during this pass, above the 4000 MiB floor.
+`DeviceContext` / `enqueue_create_buffer` / `enqueue_copy` / `enqueue_function`
+do compile on the pinned `mojo ==1.2.0.dev2026092605` (`max.gpu.host`) — they
+were reused unchanged by earlier ports — but the gate is arithmetic intensity,
+not API availability.
+
+The measured cost is already at DRAM speed, with no arithmetic to hide a
+transfer behind. Same-session `pixi run bench` on this host, each call already
+touching 8.4 MB, 69 MB and 0.18 MB (rate = bytes touched ÷ CPU time, so it
+includes the Python glue each call carries):
+
+| kernel | flops/byte | CPU time (this pass) | bytes touched | effective rate |
+| --- | ---: | ---: | ---: | ---: |
+| dense f64 2000x400 -> 1500x300 | 0.053 | 1.46 ms | 8.4 MB | 5.8 GB/s |
+| dense f64 5500x1024 -> 4500x900 | 0.058 | 12.17 ms | 69.3 MB | 5.7 GB/s |
+| CSR f64 2000x300 -> 1500x180 | 0.075 | 1.15 ms | 0.18 MB | 0.16 GB/s (glue-dominated, kernel 0.094 ms) |
+
+A GPU version would pay, per call, one host-to-device copy of the source, one
+device-to-host copy of the result and one launch before doing the same byte
+movement. At 12.17 ms for the largest case the transfer alone is a few ms over
+PCIe for 69 MB, for a kernel that has zero flops to hide it behind — so it can
+only lose. The remaining headroom in these rows is Python glue
+(`bench/analysis.md` §1, §3), which is an `unroll` problem on the CPU, not a
+GPU one.
+
+Consequences for this phase, stated explicitly:
+
+- No GPU code was added, so **no test here requires a device and none were
+  skipped**; `pixi run test` runs its full set on this CPU-only-for-kernels
+  basis. There is nothing for a GPU-less host to trip over.
+- The CPU path remains the only path, which is what a machine without a device
+  would use anyway.
+- There are no before/after kernel numbers to record, because no kernel
+  changed: the table above is before = after, measured this pass. The three
+  `pixi run bench` rows (1.46 / 12.17 / 1.15 ms against upstream 7.02 / 60.61 /
+  2.59 ms) are unchanged from the `parallel` phase.
 
 ### Parallel dense gather
 
