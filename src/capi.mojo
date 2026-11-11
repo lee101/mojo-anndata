@@ -10,23 +10,24 @@ comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
 comptime DENSE_PARALLEL_TASKS = 8
+comptime W = simd_width_of[DType.float64]()
+# Contiguous row copies step by 2*W doubles; W alone was not enough width for a
+# memory-bound copy and this is the body the copy fast path uses (README).
+comptime DENSE_COPY_WIDTH = W * 2
 
 
 def dense_take_row(src: FPtr, rows: IPtr, cols: IPtr, dst: FPtr,
                    ncols: Int, ncols_out: Int, i: Int):
-    comptime W = simd_width_of[DType.float64]()
-    var src_base = Int(rows[unsafe_offset=i]) * ncols
+    var src_base = Int(rows.unsafe_load(i)) * ncols
     var dst_base = i * ncols_out
     var j = 0
     while j + W <= ncols_out:
-        var offsets = cols.unsafe_load[width=W](j)
+        var offsets = cols.unsafe_load[width=W](j).cast[DType.int32]()
         var values = src.unsafe_offset(src_base).unsafe_gather[width=W](offsets)
-        dst.unsafe_store(dst_base + j, values)
+        dst.unsafe_store[width=W](dst_base + j, values)
         j += W
     while j < ncols_out:
-        dst[unsafe_offset=dst_base + j] = src[
-            unsafe_offset=src_base + Int(cols[unsafe_offset=j])
-        ]
+        dst.unsafe_store(dst_base + j, src.unsafe_load(src_base + Int(cols.unsafe_load(j))))
         j += 1
 
 
@@ -54,6 +55,36 @@ def mad_dense_take_f64_parallel(src_addr: Int, row_addr: Int, col_addr: Int,
         var stop = (task + 1) * nrows_out // DENSE_PARALLEL_TASKS
         for i in range(start, stop):
             dense_take_row(src, rows, cols, dst, ncols, ncols_out, i)
+
+
+@export("mad_dense_take_f64_copy")
+def mad_dense_take_f64_copy(src_addr: Int, row_addr: Int, col_addr: Int, dst_addr: Int,
+                            ncols: Int, nrows_out: Int, ncols_out: Int) abi("C"):
+    """`dst = src[rows, :]` with no column selection (i.e. `copy()` and any
+    full-column slice): DENSE_COPY_WIDTH doubles per step, scalar tail.
+
+    The Python layer only calls this when `cols` is the identity.  The loop is
+    a flat `for i in range(nrows_out)` and never reads `cols`.  On this pinned
+    toolchain only this row-loop form with a 2*W body lowered to a sound
+    contiguous copy; the `while i < nrows_out` form, the same loop called as a
+    helper per row, and a chunked `for task` over `(start, stop)` each emitted a
+    blocked body that reloaded the destination pointer from a stack slot, so
+    every row after the first wrote to row 0 (wrong values + heap corruption).
+    `dense_take_row` keeps the `for`-row form too, for the same reason."""
+    var src = FPtr(unsafe_from_address=src_addr)
+    var rows = IPtr(unsafe_from_address=row_addr)
+    var dst = FPtr(unsafe_from_address=dst_addr)
+    for i in range(nrows_out):
+        var src_base = Int(rows.unsafe_load(i)) * ncols
+        var dst_base = i * ncols
+        var j = 0
+        while j + DENSE_COPY_WIDTH <= ncols:
+            var values = src.unsafe_offset(src_base).unsafe_load[width=DENSE_COPY_WIDTH](j)
+            dst.unsafe_store[width=DENSE_COPY_WIDTH](dst_base + j, values)
+            j += DENSE_COPY_WIDTH
+        while j < ncols:
+            dst.unsafe_store(dst_base + j, src.unsafe_load(src_base + j))
+            j += 1
 
 
 @export("mad_csr_take_f64")

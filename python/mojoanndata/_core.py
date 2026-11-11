@@ -136,16 +136,33 @@ def _positions(index: Any, names: pd.Index, size: int) -> np.ndarray:
     return np.ascontiguousarray(result)
 
 
+def _is_arange(cols: np.ndarray, size: int) -> bool:
+    """True when `cols` is exactly `[0, 1, ..., size-1]`, i.e. the slice keeps
+    every column in order and the result rows are contiguous copies."""
+    if cols.size != size or cols.dtype.kind not in "iu":
+        return False
+    return bool(np.array_equal(cols, np.arange(size, dtype=cols.dtype)))
+
+
 def _take_dense(x: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
     source = np.ascontiguousarray(x)
     if source.dtype != np.float64 or not source.flags.c_contiguous:
         return source[np.ix_(rows, cols)].copy()
     target = np.empty((rows.size, cols.size), dtype=np.float64)
     if target.size:
-        kernel = (lib().mad_dense_take_f64_parallel
-                  if (target.size >= DENSE_PARALLEL_ELEMENTS
-                      and rows.size >= DENSE_PARALLEL_TASKS)
-                  else lib().mad_dense_take_f64)
+        if cols.size == source.shape[1] and _is_arange(cols, cols.size):
+            # No column selection at all: the kernel copies whole rows with a
+            # 2*W-wide contiguous loop.  This route is restricted to a full column
+            # set because on this pinned toolchain the copy kernel miscounts rows
+            # when the last vector block of a row would be partial (a non-full
+            # column count with ncols % 8 != 0), so narrowing slices stay on the
+            # element-wise gather below.  See README.
+            kernel = lib().mad_dense_take_f64_copy
+        elif (target.size >= DENSE_PARALLEL_ELEMENTS
+              and rows.size >= DENSE_PARALLEL_TASKS):
+            kernel = lib().mad_dense_take_f64_parallel
+        else:
+            kernel = lib().mad_dense_take_f64
         kernel(addr(source), addr(rows), addr(cols), addr(target), source.shape[1],
                rows.size, cols.size)
     return target
