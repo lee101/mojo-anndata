@@ -4,8 +4,6 @@ The Python layer owns allocation and index normalization.  Addresses are passed
 as Int because exported Mojo functions cannot have parametric pointer types.
 """
 
-from max.algorithm import parallelize
-from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
 
 comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
@@ -47,21 +45,15 @@ def mad_dense_take_f64(src_addr: Int, row_addr: Int, col_addr: Int, dst_addr: In
 def mad_dense_take_f64_parallel(src_addr: Int, row_addr: Int, col_addr: Int,
                                 dst_addr: Int, ncols: Int, nrows_out: Int,
                                 ncols_out: Int) abi("C"):
-    initialize_runtime()
     var src = FPtr(unsafe_from_address=src_addr)
     var rows = IPtr(unsafe_from_address=row_addr)
     var cols = IPtr(unsafe_from_address=col_addr)
     var dst = FPtr(unsafe_from_address=dst_addr)
-
-    @__parameter
-    @__copy_capture(src, rows, cols, dst, ncols, nrows_out, ncols_out)
-    def take_chunk(task: Int):
+    for task in range(DENSE_PARALLEL_TASKS):
         var start = task * nrows_out // DENSE_PARALLEL_TASKS
         var stop = (task + 1) * nrows_out // DENSE_PARALLEL_TASKS
         for i in range(start, stop):
             dense_take_row(src, rows, cols, dst, ncols, ncols_out, i)
-
-    parallelize[take_chunk](DENSE_PARALLEL_TASKS, DENSE_PARALLEL_TASKS)
 
 
 @export("mad_csr_take_f64")
