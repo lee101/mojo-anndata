@@ -113,7 +113,7 @@ def _positions(index: Any, names: pd.Index, size: int) -> np.ndarray:
     if raw.dtype.kind in "OUS":
         if raw.ndim != 1:
             raise IndexError("index must be one-dimensional")
-        found = names.get_indexer(raw.astype(object))
+        found = names.get_indexer(raw)
         if np.any(found < 0):
             missing = raw[np.flatnonzero(found < 0)[0]]
             raise KeyError(missing)
@@ -206,7 +206,10 @@ class AnnData:
 
     def __init__(self, X=None, obs=None, var=None, uns=None, obsm=None, varm=None,
                  layers=None, raw=None, dtype=None, shape=None, filename=None,
-                 filemode=None, asview=False, obsp=None, varp=None, oidx=None, vidx=None):
+                 filemode=None, asview=False, obsp=None, varp=None, oidx=None, vidx=None,
+                 *, _owns=False):
+        # `_owns` marks a private call whose arrays this object may hold without
+        # copying: the slicing paths pass freshly gathered arrays they own.
         if asview or oidx is not None or vidx is not None:
             raise NotImplementedError("views are not implemented; slicing returns an eager AnnData")
         if filename is not None or filemode is not None:
@@ -230,13 +233,18 @@ class AnnData:
             if shape is None:
                 raise ValueError("X or shape is required")
             X = np.zeros(shape, dtype=dtype or np.float64)
-        self.X = _matrix(X)
-        if dtype is not None:
-            self.X = self.X.astype(dtype)
-        # Matches anndata.AnnData.X: an array source is stored, not copied, so
-        # `layers[None] is adata.X` holds.
-        if isinstance(X, np.ndarray) and dtype is None:
-            self.X = X
+        if _owns:
+            if dtype is not None or not isinstance(layers or {}, dict):
+                raise TypeError("_owns takes no dtype conversion and a plain dict of layers")
+            self.X = X if isinstance(X, np.ndarray) else _matrix(X)
+        else:
+            self.X = _matrix(X)
+            if dtype is not None:
+                self.X = self.X.astype(dtype)
+            # Matches anndata.AnnData.X: an array source is stored, not copied, so
+            # `layers[None] is adata.X` holds.
+            if isinstance(X, np.ndarray) and dtype is None:
+                self.X = X
         supplied = (obs is not None, var is not None)
         if isinstance(X, pd.DataFrame):
             # Matches anndata.AnnData._init_as_actual: a DataFrame X supplies
@@ -264,13 +272,22 @@ class AnnData:
         # shares the parent's dict, while copy() rebuilds and deep-copies it.
         self.uns = _copy.deepcopy(dict(uns or {}))
         self.raw = None
-        self.layers = {key: _checked_layer(value, self.shape, key) for key, value in (layers or {}).items()}
+        self.layers = {key: value if _owns else _checked_layer(value, self.shape, key)
+                       for key, value in (layers or {}).items()}
         # Matches anndata.AnnData: `layers[None]` is the very same object as `.X`.
         self.layers[None] = self.X
-        self.obsm = {key: _checked_axis(value, self.n_obs, "obsm", key) for key, value in (obsm or {}).items()}
-        self.varm = {key: _checked_axis(value, self.n_vars, "varm", key) for key, value in (varm or {}).items()}
-        self.obsp = {key: _checked_pair(value, self.n_obs, "obsp", key) for key, value in (obsp or {}).items()}
-        self.varp = {key: _checked_pair(value, self.n_vars, "varp", key) for key, value in (varp or {}).items()}
+        if _owns:
+            self.obsm, self.varm = obsm or {}, varm or {}
+        else:
+            self.obsm = {key: _checked_axis(value, self.n_obs, "obsm", key) for key, value in (obsm or {}).items()}
+            self.varm = {key: _checked_axis(value, self.n_vars, "varm", key) for key, value in (varm or {}).items()}
+        self.obsp = {key: _matrix(value, f"obsp[{key!r}]") for key, value in (obsp or {}).items()}
+        self.varp = {key: _matrix(value, f"varp[{key!r}]") for key, value in (varp or {}).items()}
+        for collection, expected in (("obsp", (self.n_obs, self.n_obs)),
+                                     ("varp", (self.n_vars, self.n_vars))):
+            for key, value in getattr(self, collection).items():
+                if value.shape != expected:
+                    raise ValueError(f"{collection}[{key!r}] must have shape {expected}")
         # Matches anndata.AnnData._check_uniqueness warning via utils.warn_names_duplicates.
         for attr in ("obs", "var"):
             index = getattr(self, attr).index
@@ -333,6 +350,8 @@ class AnnData:
         obs_index, var_index = _unpack_index(index)
         rows = _positions(obs_index, self.obs_names, self.n_obs)
         cols = _positions(var_index, self.var_names, self.n_vars)
+        # Every array below is freshly allocated by this call, so `_owns` lets the
+        # result hold them instead of copying each one a second time.
         result = AnnData(_take_matrix(self.X, rows, cols), obs=self.obs.iloc[rows].copy(),
                          var=self.var.iloc[cols].copy(), uns=self.uns,
                          layers={k: _take_matrix(v, rows, cols) for k, v in self.layers.items()
@@ -340,7 +359,8 @@ class AnnData:
                          obsm={k: _take_axis(v, rows) for k, v in self.obsm.items()},
                          varm={k: _take_axis(v, cols) for k, v in self.varm.items()},
                          obsp={k: _take_matrix(v, rows, rows) for k, v in self.obsp.items()},
-                         varp={k: _take_matrix(v, cols, cols) for k, v in self.varp.items()})
+                         varp={k: _take_matrix(v, cols, cols) for k, v in self.varp.items()},
+                         _owns=True)
         # Matches anndata.AnnData._init_as_view: the view shares the parent's uns
         # dict (there are no lazy views here, only eager arrays).
         result.uns = self.uns
@@ -360,7 +380,8 @@ class AnnData:
                          obsm={k: _take_axis(v, rows) for k, v in self.obsm.items()},
                          varm={k: _take_axis(v, cols) for k, v in self.varm.items()},
                          obsp={k: _take_matrix(v, rows, rows) for k, v in self.obsp.items()},
-                         varp={k: _take_matrix(v, cols, cols) for k, v in self.varp.items()})
+                         varp={k: _take_matrix(v, cols, cols) for k, v in self.varp.items()},
+                         _owns=True)
         return result
 
     def to_memory(self, copy=False):
@@ -425,7 +446,7 @@ def _checked_layer(value, shape, key):
 def _checked_axis(value, n, collection, key):
     if isinstance(value, pd.DataFrame):
         result = value.copy()
-    elif sparse.issparse(value):
+    elif sparse.issparse(value) or value.ndim != 2:
         result = value.copy()
     else:
         result = np.asarray(value).copy()

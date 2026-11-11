@@ -60,15 +60,34 @@ pixi run bench
 
 ## Benchmark
 
-Measured with `pixi run bench` on `Linux-6.8.0-136-generic-x86_64-with-glibc2.39`
+Measured with `pixi run bench` on `Linux-6.8.0-147-generic-x86_64-with-glibc2.39`
 (`x86_64`), best of five identical eager slices. The comparison is against the
-installed upstream `anndata` on the same arrays.
+installed upstream `anndata` (0.13.2) on the same arrays. "before" is `master`
+at `4fe6c1a`, "after" is this revision; both were measured with the same harness
+on a shared 72-CPU host. Each cell is the fastest of several runs, which is what
+`bench/bench.py` reports; the large dense row ranged 11.23-13.46 ms across the
+after-runs and 17.41-17.88 ms across the before-runs.
 
-| kernel | mojo-anndata | anndata | speedup |
-| --- | ---: | ---: | ---: |
-| dense f64 2000x400 -> 1500x300 | 1.22 ms | 6.71 ms | 5.51x |
-| dense f64 5500x1024 -> 4500x900 | 10.56 ms | 80.39 ms | 7.61x |
-| CSR f64 2000x300 -> 1500x180 | 0.84 ms | 2.59 ms | 3.10x |
+| kernel | before | after | anndata | speedup (after) |
+| --- | ---: | ---: | ---: | ---: |
+| dense f64 2000x400 -> 1500x300 | 1.42 ms | 1.19 ms | 5.95 ms | 5.01x |
+| dense f64 5500x1024 -> 4500x900 | 17.41 ms | 11.23 ms | 60.04 ms | 5.34x |
+| CSR f64 2000x300 -> 1500x180 | 1.03 ms | 1.02 ms | 2.41 ms | 2.36x |
+
+The gain is in the Python glue, not the kernels: the two larger rows were
+dominated by work outside Mojo (`bench/analysis.md` §1). The dense kernels run
+no floating-point arithmetic at all, so nothing was reordered: results are
+bit-identical and every existing tolerance is unchanged.
+
+The workloads where that glue dominates most (`bench/analysis.md` §1), same
+shapes (5500x1024 -> 4500x900), alternating before/after in one session:
+
+| workload | before | after |
+| --- | ---: | ---: |
+| `__getitem__`, 2 layers + 2 `obsm`, integer positions | 45.3 ms | 33.7 ms |
+| same, string label selectors | 48.6 ms | 35.1 ms |
+| `__getitem__`, no layers | 17.5 ms | 11.1 ms |
+| `copy()`, 2 layers + `obsm` | 134 ms | 70 ms |
 
 Numbers are workload- and machine-specific; rerun the benchmark before making
 performance decisions for a different matrix shape or sparsity pattern.
@@ -85,8 +104,11 @@ addresses as signed 64-bit integers, which the single Mojo compilation unit
 rebuilds as pointers. Dense matrices are row-major `float64`; the CSR kernel
 walks `indptr`, `indices`, and `data` once for each selected source row while a
 column map translates source columns into the destination layout. Dense slices
-with at least two million output elements are split across eight independent
-row chunks; smaller slices stay serial. Canonical CSR inputs are borrowed
-without a copy, and native int32 and int64 index kernels avoid dtype conversion
-at the FFI boundary. Python owns every allocation, so the native library has no
-allocation or lifetime policy.
+with at least two million output elements take the `_parallel` symbol, which
+walks the same eight row chunks in order (there is no threading yet). Canonical
+CSR inputs are borrowed without a copy, and native int32 and int64 index kernels
+avoid dtype conversion at the FFI boundary. Python owns every allocation, so the
+native library has no allocation or lifetime policy. Slicing passes only arrays
+it just allocated to a private constructor flag, so the result holds them
+instead of copying each one a second time; a public constructor still copies its
+inputs.
