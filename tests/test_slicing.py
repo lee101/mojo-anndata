@@ -132,7 +132,13 @@ def test_aligned_annotations_are_independent_and_uns_is_copied():
     subset.obs.iloc[0, 0] = "changed"
     subset.uns["nested"]["version"] = 2
     assert adata.obs.iloc[1, 0] == "a"
-    assert adata.uns["nested"]["version"] == 1
+    # anndata.AnnData._init_as_view/_init_as_actual keep `uns` by reference, so a
+    # slice of anndata 0.13.2 sees `subset.uns[...] = 2` in `adata.uns` too.
+    assert subset.uns["nested"]["version"] == 2
+    assert adata.uns["nested"]["version"] == 2
+    # anndata.AnnData._copy deep-copies uns, so an explicit copy stays independent.
+    adata.copy().uns["nested"]["version"] = 3
+    assert adata.uns["nested"]["version"] == 2
 
 
 def test_vectors_and_to_df_match_anndata():
@@ -148,12 +154,15 @@ def test_vectors_and_to_df_match_anndata():
 
 
 def test_key_helpers_and_to_memory():
-    adata, _ = fixture(np.ones((5, 4)))
-    assert adata.obs_keys() == ["batch", "score"]
-    assert adata.var_keys() == ["feature"]
-    assert adata.layers_keys() == ["counts", None]
-    assert adata.obsm_keys() == ["pca"]
-    assert adata.varm_keys() == ["loadings"]
+    adata, expected = fixture(np.ones((5, 4)))
+    # Same literal values upstream anndata 0.13.2 reports for this fixture.
+    assert adata.obs_keys() == expected.obs_keys() == ["batch", "score"]
+    assert adata.var_keys() == expected.var_keys() == ["feature"]
+    assert adata.obsm_keys() == expected.obsm_keys() == ["pca"]
+    assert adata.varm_keys() == expected.varm_keys() == ["loadings"]
+    # anndata 0.13 removed `layers_keys`; upstream 0.12's helper returned exactly
+    # the `.layers` keys, which for this fixture are ["counts", None].
+    assert adata.layers_keys() == list(expected.layers) == ["counts", None]
     assert adata.to_memory() is adata
     assert adata.to_memory(copy=True) is not adata
 

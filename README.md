@@ -15,7 +15,8 @@ can move over without changing its slicing calls.
 - CSR `float64` row-and-column slicing is performed in Mojo, preserving a CSR
   result. Repeated column selections use SciPy's correct fallback.
 - `obs`, `var`, `layers`, `obsm`, `varm`, `obsp`, `varp`, and `uns` remain
-  aligned and are eagerly copied during a slice.
+  aligned and are eagerly copied during a slice. `uns` alone is shared with the
+  slice's parent, as in upstream anndata views; `copy()` deep-copies it.
 - `shape`, `n_obs`, `n_vars`, `obs_names`, `var_names`, `copy`, `to_df`,
   `obs_vector`, `var_vector`, and the `*_keys` helpers are available.
 

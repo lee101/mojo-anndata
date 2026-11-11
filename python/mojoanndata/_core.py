@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy as _copy
+import warnings
 from collections.abc import Mapping
 from typing import Any
 
@@ -17,11 +18,31 @@ DENSE_PARALLEL_TASKS = 8
 
 
 def _frame(value: Any, n: int, axis: str) -> pd.DataFrame:
+    # Matches anndata.aligned_df._gen_dataframe: an index key names the row index.
+    index_keys = {"obs_names", "row_names"} if axis == "observations" else {"var_names", "col_names"}
     if value is None:
-        return pd.DataFrame(index=pd.Index([str(i) for i in range(n)]))
-    frame = value.copy() if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
+        frame = pd.DataFrame(index=pd.Index([str(i) for i in range(n)]))
+    elif isinstance(value, pd.DataFrame):
+        frame = value.copy()
+        if frame.index.dtype.kind != "O" and not isinstance(frame.index.dtype, pd.StringDtype):
+            # Matches anndata.aligned_df._gen_dataframe: a non-string index is
+            # converted to str (upstream warns ImplicitModificationWarning).
+            frame.index = pd.Index([str(i) for i in frame.index])
+    elif isinstance(value, np.ndarray) and value.ndim < 2:
+        raise ValueError(f"{axis} must be two-dimensional")
+    elif isinstance(value, Mapping) and index_keys & set(value):
+        index_key = next(iter(index_keys & set(value)))
+        frame = pd.DataFrame({k: v for k, v in value.items() if k != index_key},
+                             index=pd.Index(value[index_key]))
+    else:
+        frame = pd.DataFrame(value)
     if len(frame) != n:
         raise ValueError(f"{axis} must have as many rows as X has {axis}")
+    if frame.columns.dtype.kind in "iu":
+        # Matches anndata.AnnData._set_dim_df: `if not len(value.columns):
+        # value.columns = value.columns.astype(str)`; columns become a str index,
+        # so `k in adata.var` never matches integer keys.
+        frame.columns = pd.Index(list(frame.columns), dtype=str, name=frame.columns.name)
     return frame
 
 
@@ -31,48 +52,84 @@ def _matrix(value: Any, name: str = "X"):
             raise ValueError(f"{name} must be two-dimensional")
         return value.copy()
     array = np.asarray(value)
-    if array.ndim != 2:
+    # anndata `_init_as_actual` takes `X.shape[:2]`, so X may carry trailing dims.
+    if array.ndim < 2:
         raise ValueError(f"{name} must be two-dimensional")
     return array.copy()
+
+
+def _unpack_index(index):
+    # Matches anndata.index.unpack_index: one optional Ellipsis, at most two axes.
+    if not isinstance(index, tuple):
+        return slice(None) if index is Ellipsis else index, slice(None)
+    n_ellipsis = sum(item is Ellipsis for item in index)
+    if n_ellipsis > 1:
+        raise IndexError("an index can only have a single ellipsis ('...')")
+    if len(index) > 2:
+        if not n_ellipsis:
+            raise IndexError("Received a length 3 index without an ellipsis")
+        return tuple(item for item in index if item is not Ellipsis)
+    if len(index) == 2:
+        return tuple(slice(None) if item is Ellipsis else item for item in index)
+    if len(index) == 1:
+        item = index[0]
+        return (slice(None) if item is Ellipsis else item), slice(None)
+    raise IndexError("invalid number of indices")
 
 
 def _positions(index: Any, names: pd.Index, size: int) -> np.ndarray:
     """Resolve NumPy-style integer/mask selectors plus AnnData string names."""
     if isinstance(index, slice):
+        if isinstance(index.start, str) or isinstance(index.stop, str):
+            # Matches anndata.index._from_slice: label slices are inclusive.
+            start, stop = index.start, index.stop
+            if isinstance(start, str):
+                start = names.get_loc(start)
+            if isinstance(stop, str):
+                stop = names.get_loc(stop) + 1
+            index = slice(start, stop, index.step)
         return np.ascontiguousarray(np.arange(size, dtype=np.int64)[index])
     if isinstance(index, (str, bytes)):
         found = names.get_indexer([index])
         if found[0] < 0:
             raise KeyError(index)
         return np.ascontiguousarray(found.astype(np.int64))
-    raw = np.asarray(index if not isinstance(index, pd.Series) else index.to_numpy())
+    if isinstance(index, pd.api.extensions.ExtensionArray):
+        raw = np.asarray(index)
+    else:
+        raw = np.asarray(index.to_numpy() if isinstance(index, pd.Series) else index)
     if raw.ndim == 0:
         value = raw.item()
         if isinstance(value, (str, bytes)):
             return _positions(value, names, size)
         raw = np.asarray([value])
+    # Matches anndata.index._from_array: the (n, 1) / (1, n) column form is raveled.
+    if raw.shape == (size, 1) or raw.shape == (1, size):
+        raw = raw.ravel()
     if raw.dtype.kind == "b":
         if raw.ndim != 1 or raw.size != size:
             raise IndexError(f"Boolean index has shape {raw.shape}; expected ({size},)")
         return np.ascontiguousarray(np.flatnonzero(raw).astype(np.int64))
     if raw.dtype.kind in "OUS":
+        if raw.ndim != 1:
+            raise IndexError("index must be one-dimensional")
         found = names.get_indexer(raw.astype(object))
         if np.any(found < 0):
             missing = raw[np.flatnonzero(found < 0)[0]]
             raise KeyError(missing)
         return np.ascontiguousarray(found.astype(np.int64))
-    if raw.ndim != 1:
-        raise IndexError("index must be one-dimensional")
-    if raw.dtype.kind == "u":
-        # Converting a uint64 greater than Int64.max would wrap it negative.
-        if np.any(raw >= size):
-            raise IndexError("index out of bounds")
-    elif raw.dtype.kind == "f":
+    if raw.dtype.kind == "f":
         if not np.all(np.isfinite(raw)) or not np.all(raw == np.floor(raw)):
             raise IndexError("indices must be integers")
-    elif raw.dtype.kind != "i":
+    elif raw.dtype.kind not in "iu":
         raise IndexError("indices must be integers, names, or boolean masks")
-    result = np.asarray(raw, dtype=np.int64)
+    if raw.ndim != 1:
+        raise IndexError("index must be one-dimensional")
+    result = np.array(raw, dtype=np.int64)
+    if raw.dtype.kind == "u":
+        # Matches anndata.index._from_array: unsigned arrays are viewed as signed
+        # before NumPy bounds-checks them, so values below 2**63 resolve normally.
+        result = result.view(np.int64)
     result = np.where(result < 0, result + size, result)
     if np.any((result < 0) | (result >= size)):
         raise IndexError("index out of bounds")
@@ -156,6 +213,19 @@ class AnnData:
             raise NotImplementedError("backed .h5ad files are outside the in-memory slicing subset")
         if raw is not None:
             raise NotImplementedError("raw is outside the covered annotated-slicing subset")
+        if isinstance(X, AnnData):
+            # Matches anndata.AnnData._init_as_actual: build from another AnnData.
+            if any(item is not None for item in (obs, var, uns, obsm, varm, obsp, varp)):
+                raise ValueError("If `X` is a dict no further arguments must be provided.")
+            obs, var, uns = X.obs, X.var, X.uns
+            obsm, varm, obsp, varp = X.obsm, X.varm, X.obsp, X.varp
+            layers = dict(X.layers)
+            X = X.layers.get(None)
+        if layers is not None and None in layers:
+            # Matches anndata.AnnData._init_as_actual: layers[None] replaces X.
+            if X is not None and X is not layers[None]:
+                raise ValueError("If you provide `layers[None]` and `X`, they must be identical.")
+            X = layers[None]
         if X is None:
             if shape is None:
                 raise ValueError("X or shape is required")
@@ -163,20 +233,56 @@ class AnnData:
         self.X = _matrix(X)
         if dtype is not None:
             self.X = self.X.astype(dtype)
+        # Matches anndata.AnnData.X: an array source is stored, not copied, so
+        # `layers[None] is adata.X` holds.
+        if isinstance(X, np.ndarray) and dtype is None:
+            self.X = X
+        supplied = (obs is not None, var is not None)
+        if isinstance(X, pd.DataFrame):
+            # Matches anndata.AnnData._init_as_actual: a DataFrame X supplies
+            # obs_names/var_names when those frames are absent or default.
+            if obs is None:
+                obs = pd.DataFrame(index=X.index)
+            if var is None:
+                var = pd.DataFrame(index=X.columns)
         self.obs = _frame(obs, self.n_obs, "observations")
         self.var = _frame(var, self.n_vars, "variables")
+        if isinstance(X, pd.DataFrame):
+            for attr, label, given in (("obs", "index", supplied[0]), ("var", "columns", supplied[1])):
+                if given:
+                    continue
+                frame = getattr(self, attr)
+                source = X.index if attr == "obs" else X.columns
+                if (frame.index.equals(pd.Index([str(i) for i in range(len(source))]))
+                        and not source.equals(frame.index)):
+                    # Matches anndata.AnnData._init_as_actual: a default index takes
+                    # X's labels; otherwise the labels must agree exactly.
+                    frame.index = source
+                elif not frame.index.equals(source):
+                    raise ValueError(f"Index of {attr} must match {label} of X.")
+        # Matches anndata.AnnData._init_as_actual (`self._uns = uns`): a slice
+        # shares the parent's dict, while copy() rebuilds and deep-copies it.
         self.uns = _copy.deepcopy(dict(uns or {}))
+        self.raw = None
         self.layers = {key: _checked_layer(value, self.shape, key) for key, value in (layers or {}).items()}
-        # anndata exposes X through the None layer key as well as through .X.
-        self.layers.setdefault(None, self.X)
+        # Matches anndata.AnnData: `layers[None]` is the very same object as `.X`.
+        self.layers[None] = self.X
         self.obsm = {key: _checked_axis(value, self.n_obs, "obsm", key) for key, value in (obsm or {}).items()}
         self.varm = {key: _checked_axis(value, self.n_vars, "varm", key) for key, value in (varm or {}).items()}
         self.obsp = {key: _checked_pair(value, self.n_obs, "obsp", key) for key, value in (obsp or {}).items()}
         self.varp = {key: _checked_pair(value, self.n_vars, "varp", key) for key, value in (varp or {}).items()}
+        # Matches anndata.AnnData._check_uniqueness warning via utils.warn_names_duplicates.
+        for attr in ("obs", "var"):
+            index = getattr(self, attr).index
+            if index[~index.isna()].has_duplicates:
+                names = "Observation" if attr == "obs" else "Variable"
+                warnings.warn(f"{names} names are not unique. To make them unique, "
+                              f"call `.{attr}_names_make_unique`.", UserWarning, stacklevel=2)
 
     @property
     def shape(self):
-        return self.X.shape
+        # Matches anndata.AnnData.shape: only the first two axes count.
+        return self.X.shape[:2]
 
     @property
     def n_obs(self):
@@ -212,15 +318,43 @@ class AnnData:
     def is_view(self):
         return False
 
+    def __getattr__(self, name):
+        # Matches anndata.AnnData: `.obsm`, `.obsp`, `.layers`, `.varm`, `.varp`,
+        # `.raw` and `.X` are readable through `AnnData.<name>`; they all return
+        # plain objects here because this port has no element references.
+        if name in {"X", "obsm", "obsp", "layers", "varm", "varp", "raw"}:
+            return object.__getattribute__(self, name)
+        raise AttributeError(f"'AnnData' object has no attribute {name!r}")
+
     def __repr__(self):
         return f"AnnData object with n_obs × n_vars = {self.n_obs} × {self.n_vars}"
 
     def __getitem__(self, index):
-        obs_index, var_index = index if isinstance(index, tuple) else (index, slice(None))
+        obs_index, var_index = _unpack_index(index)
         rows = _positions(obs_index, self.obs_names, self.n_obs)
         cols = _positions(var_index, self.var_names, self.n_vars)
         result = AnnData(_take_matrix(self.X, rows, cols), obs=self.obs.iloc[rows].copy(),
-                         var=self.var.iloc[cols].copy(), uns=_copy.deepcopy(self.uns),
+                         var=self.var.iloc[cols].copy(), uns=self.uns,
+                         layers={k: _take_matrix(v, rows, cols) for k, v in self.layers.items()
+                                 if k is not None},
+                         obsm={k: _take_axis(v, rows) for k, v in self.obsm.items()},
+                         varm={k: _take_axis(v, cols) for k, v in self.varm.items()},
+                         obsp={k: _take_matrix(v, rows, rows) for k, v in self.obsp.items()},
+                         varp={k: _take_matrix(v, cols, cols) for k, v in self.varp.items()})
+        # Matches anndata.AnnData._init_as_view: the view shares the parent's uns
+        # dict (there are no lazy views here, only eager arrays).
+        result.uns = self.uns
+        return result
+
+    def copy(self, filename=None):
+        if filename is not None:
+            raise NotImplementedError("backed copies are not implemented")
+        # Matches anndata.AnnData._copy: independent arrays and a deep-copied uns,
+        # unlike `self[:, :]`, which shares uns with its parent.
+        rows = np.arange(self.n_obs, dtype=np.int64)
+        cols = np.arange(self.n_vars, dtype=np.int64)
+        result = AnnData(_take_matrix(self.X, rows, cols), obs=self.obs.copy(),
+                         var=self.var.copy(), uns=_copy.deepcopy(self.uns),
                          layers={k: _take_matrix(v, rows, cols) for k, v in self.layers.items()
                                  if k is not None},
                          obsm={k: _take_axis(v, rows) for k, v in self.obsm.items()},
@@ -228,11 +362,6 @@ class AnnData:
                          obsp={k: _take_matrix(v, rows, rows) for k, v in self.obsp.items()},
                          varp={k: _take_matrix(v, cols, cols) for k, v in self.varp.items()})
         return result
-
-    def copy(self, filename=None):
-        if filename is not None:
-            raise NotImplementedError("backed copies are not implemented")
-        return self[:, :]
 
     def to_memory(self, copy=False):
         return self.copy() if copy else self
@@ -243,18 +372,26 @@ class AnnData:
         return pd.DataFrame(values, index=self.obs_names, columns=self.var_names)
 
     def obs_vector(self, k, *, layer=None):
+        # Matches anndata.index._get_vector_ambiguous for dim="obs".
         matrix = self.layers[layer] if layer is not None else self.X
+        if k in self.obs.columns and k in self.var_names:
+            raise ValueError(f"Key {k} could be found in both .var_names and .obs.columns")
         if k in self.obs.columns:
-            return self.obs[k].to_numpy()
-        pos = _positions(k, self.var_names, self.n_vars)[0]
-        return matrix[:, pos].toarray().ravel() if sparse.issparse(matrix) else matrix[:, pos].copy()
+            return np.asarray(self.obs[k])
+        if k not in self.var_names:
+            raise KeyError(f"Could not find key {k} in .var_names or .obs.columns.")
+        return np.asarray(matrix[:, self.var_names.get_loc(k)]).ravel()
 
     def var_vector(self, k, *, layer=None):
+        # Matches anndata.index._get_vector_ambiguous for dim="var".
         matrix = self.layers[layer] if layer is not None else self.X
+        if k in self.var.columns and k in self.obs_names:
+            raise ValueError(f"Key {k} could be found in both .obs_names and .var.columns")
         if k in self.var.columns:
-            return self.var[k].to_numpy()
-        pos = _positions(k, self.obs_names, self.n_obs)[0]
-        return matrix[pos, :].toarray().ravel() if sparse.issparse(matrix) else matrix[pos, :].copy()
+            return np.asarray(self.var[k])
+        if k not in self.obs_names:
+            raise KeyError(f"Could not find key {k} in .obs_names or .var.columns.")
+        return np.asarray(matrix[self.obs_names.get_loc(k), :]).ravel()
 
     def obs_keys(self):
         return list(self.obs.columns)
@@ -268,7 +405,13 @@ class AnnData:
     def varm_keys(self):
         return list(self.varm)
 
+    def uns_keys(self):
+        # Matches anndata.AnnData.uns_keys (deprecated upstream since 0.13).
+        return sorted(self.uns)
+
     def layers_keys(self):
+        # Upstream 0.13.2 dropped this helper; it returns the `.layers` keys that
+        # 0.12's `layers_keys` returned, including the `None` key for `.X`.
         return list(self.layers)
 
 
