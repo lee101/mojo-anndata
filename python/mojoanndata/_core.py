@@ -13,8 +13,7 @@ from scipy import sparse
 
 from ._lib import addr, lib
 
-DENSE_PARALLEL_ELEMENTS = 2_000_000
-DENSE_PARALLEL_TASKS = 8
+DENSE_PARALLEL_ELEMENTS = 8_000_000
 
 
 def _frame(value: Any, n: int, axis: str) -> pd.DataFrame:
@@ -144,6 +143,12 @@ def _is_arange(cols: np.ndarray, size: int) -> bool:
     return bool(np.array_equal(cols, np.arange(size, dtype=cols.dtype)))
 
 
+def _dense_worker_count() -> int:
+    """The compiled worker count of the parallel kernel, read from the shared
+    library so tests assert against the real value instead of a copy of it."""
+    return int(lib().mad_dense_parallel_workers())
+
+
 def _take_dense(x: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
     source = np.ascontiguousarray(x)
     if source.dtype != np.float64 or not source.flags.c_contiguous:
@@ -159,7 +164,11 @@ def _take_dense(x: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray
             # element-wise gather below.  See README.
             kernel = lib().mad_dense_take_f64_copy
         elif (target.size >= DENSE_PARALLEL_ELEMENTS
-              and rows.size >= DENSE_PARALLEL_TASKS):
+              and rows.size >= _dense_worker_count()):
+            # Gated in elements: the crossover where threading stops losing to
+            # the serial gather is ~4.5M output elements, so this sits at 8M.
+            # `rows.size >= workers` keeps the row-per-work-item split from
+            # giving a worker nothing to do.  See README for the measurements.
             kernel = lib().mad_dense_take_f64_parallel
         else:
             kernel = lib().mad_dense_take_f64

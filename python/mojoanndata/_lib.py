@@ -14,6 +14,7 @@ _SIGNATURES = {
     "mad_dense_take_f64": ([I, I, I, I, I, I, I], None),
     "mad_dense_take_f64_parallel": ([I, I, I, I, I, I, I], None),
     "mad_dense_take_f64_copy": ([I, I, I, I, I, I, I], None),
+    "mad_dense_parallel_workers": ([], I),
     "mad_csr_take_f64": ([I, I, I, I, I, I, I, I, I], I),
     "mad_csr_take_f64_i32": ([I, I, I, I, I, I, I, I, I], I),
 }

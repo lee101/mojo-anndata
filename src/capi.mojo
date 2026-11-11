@@ -6,10 +6,19 @@ as Int because exported Mojo functions cannot have parametric pointer types.
 
 from std.sys.info import simd_width_of
 
+# On 1.2.0 `parallelize` lives in `max.algorithm`, not `std.algorithm` or
+# `std.threading` (MOJO_NOTES.md section 4).  Those two do not compile here.
+from max.algorithm import parallelize
+
 comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
-comptime DENSE_PARALLEL_TASKS = 8
+# Worker count for the parallel dense gather.  The host is shared and the
+# kernel is memory-bound, so 4 is the ceiling unless a benchmark shows more
+# helps (README records the 1/2/4/cap sweep).
+comptime DENSE_PARALLEL_WORKERS = 4
+# Each worker item copies one output row.  parallelize calls the worker once
+# per item, so the row loop is exactly the serial loop's work, redistributed.
 comptime W = simd_width_of[DType.float64]()
 # Contiguous row copies step by 2*W doubles; W alone was not enough width for a
 # memory-bound copy and this is the body the copy fast path uses (README).
@@ -46,15 +55,27 @@ def mad_dense_take_f64(src_addr: Int, row_addr: Int, col_addr: Int, dst_addr: In
 def mad_dense_take_f64_parallel(src_addr: Int, row_addr: Int, col_addr: Int,
                                 dst_addr: Int, ncols: Int, nrows_out: Int,
                                 ncols_out: Int) abi("C"):
+    """Same row gather as `mad_dense_take_f64`, one output row per work item,
+    run through `max.algorithm.parallelize`.
+
+    Each row writes only its own destination range and reads only its own
+    source row, so the result is bit-identical to the serial kernel whatever
+    the row-to-worker assignment.  The Python layer gates this on output size;
+    small slices stay on the serial symbol."""
     var src = FPtr(unsafe_from_address=src_addr)
     var rows = IPtr(unsafe_from_address=row_addr)
     var cols = IPtr(unsafe_from_address=col_addr)
     var dst = FPtr(unsafe_from_address=dst_addr)
-    for task in range(DENSE_PARALLEL_TASKS):
-        var start = task * nrows_out // DENSE_PARALLEL_TASKS
-        var stop = (task + 1) * nrows_out // DENSE_PARALLEL_TASKS
-        for i in range(start, stop):
-            dense_take_row(src, rows, cols, dst, ncols, ncols_out, i)
+    def take_one_row(i: Int) {imm}:
+        dense_take_row(src, rows, cols, dst, ncols, ncols_out, i)
+    parallelize(take_one_row, nrows_out, DENSE_PARALLEL_WORKERS)
+
+
+@export("mad_dense_parallel_workers")
+def mad_dense_parallel_workers() abi("C") -> Int:
+    """The worker count the parallel kernel was compiled with, for callers and
+    tests that must agree with the compiled value rather than restate it."""
+    return DENSE_PARALLEL_WORKERS
 
 
 @export("mad_dense_take_f64_copy")

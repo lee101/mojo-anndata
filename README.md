@@ -96,6 +96,72 @@ Dense and CSR slicing are memory-bound gathers/scatters with effectively zero
 arithmetic intensity, so there is no GPU path: transfer and launch overhead
 would lose to the CPU implementation.
 
+### Parallel dense gather
+
+Dense slicing is the one kernel split across cores. The `_parallel` symbol used
+to walk eight row chunks **in one thread** — it was never parallel, and the 2M
+element gate sent large slices to it anyway. It now runs the same per-row gather
+through `max.algorithm.parallelize` (`src/capi.mojo`); the `std.algorithm` and
+`std.threading` forms do not compile on this toolchain. Each work item writes one
+output row, so the result is **bit-identical** to the serial kernel whatever the
+row-to-worker assignment; `tests/test_parallel.py` asserts that directly for both
+symbols on the same input, including a slice with fewer rows than workers.
+
+Measurements below are kernel-only (`_take_dense` on pre-built int64 index
+arrays, full ctypes path minus `np.empty`), median of 21 interleaved serial /
+parallel pairs on one process each, under `flock`, on the shared 72-CPU host
+above. Worker count is compiled in, so the 1/2/4 sweep is a rebuild per row.
+`×` = parallel_worker ÷ serial, below 1.00 means parallel wins:
+
+| output elements | serial | 1 worker | 2 workers | 4 workers | 8 workers | 16 workers |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2.25M (1500x1500) | 5.25 ms | 1.00 | 4.84 | 4.22 | 3.98 | 4.37 |
+| 3.375M (2250x1500) | 8.01 ms | 1.05 | 2.10 | 1.85 | 1.72 | 2.14 |
+| 4.5M (3000x1500) | 10.85 ms | 1.00 | 1.76 | 0.96 | — | — |
+| 5.625M (3750x1500) | 14.05 ms | 1.05 | 1.47 | 0.81 | — | — |
+| 9.0M (6000x1500) | 22.01 ms | 1.06 | 1.16 | 0.63 | — | — |
+
+Read as factors against serial: one worker is the row-at-a-time kernel with zero
+thread cost, so it is the fair "not parallel" baseline; any worker count above 1
+starts the thread machinery. The crossover to a win is **~4.5M output elements**
+(≈36 MB of result); at 2.25M four workers is 4.2x *slower*. Above the crossover
+the gain grows with size (0.81 at 5.6M, 0.63 at 9M) and the marginal return is
+real but small — 2→4 workers is about 1.3x, and 8/16 were measured at 2.25M and
+3.375M where the rows were *already* near break-even, i.e. those columns test
+over-subscription against the launch cost, not scaling at scale.
+
+**Four workers is the cap and the shipping value.** The host is shared and the
+gather is DRAM-bound, the gain flattened from 4 to 8 in every row where both were
+measured (0.96→1.72 is dominated by the fixed cost, not bandwidth), and 16 was
+never better than 8. 2 workers lost at every size tested, so it is not used.
+
+**Gate: 8,000,000 output elements**, a margin of ~1.75x above the measured 4.5M
+crossover, plus `rows >= workers`. Real callers therefore stay serial well past
+the point where threading starts to win: the 5.06M element slice
+(`6000x1500 -> 4500x1125`, measured 19.95 ms serial vs 12.12 ms four-worker
+kernel) still routes to the serial kernel, because above that size the ctor and
+allocation around the gather dominate anyway. Through the real
+`AnnData.__getitem__`, turning the compiled worker count down to 1 (i.e. serial
+routing everywhere) to a 4-worker build:
+
+| slice | 1 worker build | 4 workers, shipped | anndata |
+| --- | ---: | ---: | ---: |
+| 8000x2000 -> 6000x1500 (9.0M, above gate) | 47.85 ms | **23.27 ms** | 202.78 ms |
+| 2000x400 -> 1500x300 (0.45M, below gate) | 1.35 ms | 1.16 ms | 5.99 ms |
+| 5500x1024 -> 4500x900 (4.05M, below gate) | 11.35 ms | 11.55 ms | 59.02 ms |
+
+Only the row above the gate moves; the two below it are unchanged within the
+run-to-run spread, which is the point of the threshold. The `pixi run bench`
+rows from the top of this section are unchanged by this phase (1.16 / 11.55 /
+1.04 ms against 1.25 / 11.93 / 1.08 ms before it): all three are below the gate
+and still take the serial kernel, as intended. Nothing here was reverted — the
+parallel path wins at exactly the sizes it now runs at — but it is a small,
+late-arriving win: below ~4.5M elements the honest parallel path *loses* to
+serial, and the code routes those sizes to serial rather than shipping a
+parallelism that would be worse than none. The cost of being wrong is the
+per-call thread cost above (~4.5-5 ms of worker startup at any n) times the
+number of calls, which is why the gate is not merely at the crossover.
+
 ## How it works
 
 Python resolves labels and NumPy-style selectors, allocates the result, and
@@ -104,8 +170,11 @@ addresses as signed 64-bit integers, which the single Mojo compilation unit
 rebuilds as pointers. Dense matrices are row-major `float64`; the CSR kernel
 walks `indptr`, `indices`, and `data` once for each selected source row while a
 column map translates source columns into the destination layout. Dense slices
-with at least two million output elements take the `_parallel` symbol, which
-walks the same eight row chunks in order (there is no threading yet). Canonical
+with at least eight million output elements take the `_parallel` symbol, which
+runs the same row gather through `max.algorithm.parallelize` with one output row
+per work item and four workers; everything smaller, including the 4.5 million
+element point where threading first breaks even, stays on the serial kernel
+(see *Parallel dense gather* below). Canonical
 CSR inputs are borrowed without a copy, and native int32 and int64 index kernels
 avoid dtype conversion at the FFI boundary. Python owns every allocation, so the
 native library has no allocation or lifetime policy. Slicing passes only arrays
